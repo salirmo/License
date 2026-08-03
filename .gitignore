@@ -1,0 +1,75 @@
+# CMake build directories
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# CMake and Ninja generated files (protect against in-source builds)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+Testing/
+
+# Qt generated files
+*_autogen/
+.qmake.stash
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Qt Creator and other IDE user settings
+/.qtcreator/
+*.user
+*.user.*
+/.cache/
+/.qt/
+/.vscode/
+/.idea/
+
+# Compiled objects, libraries, and executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.app/
+
+# Debugging, coverage, and profiling output
+*.dSYM/
+*.debug
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+core
+core.*
+
+# Private licensing material and generated licenses
+private.pem
+*.private.pem
+*.key
+*.license
+*.lic
+issued_licenses.json
+
+# Logs and temporary/editor files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
