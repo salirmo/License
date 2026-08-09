@@ -14,6 +14,7 @@ struct License {
     QString owner;
     QDateTime issueDate;
     QDateTime expiryDate;
+    int fingerprintPolicyVersion = 1;
     QString fingerprintHash;
     QJsonArray fingerprintComponents;
     QString nonce;

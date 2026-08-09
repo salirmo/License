@@ -2,7 +2,6 @@
 
 #include <QJsonDocument>
 #include <QStringList>
-#include <QTimeZone>
 
 #include <algorithm>
 
@@ -26,15 +25,24 @@ QJsonObject License::toJson() const {
     QJsonObject fingerprint;
     fingerprint.insert(QStringLiteral("hash"), fingerprintHash);
     fingerprint.insert(QStringLiteral("components"), fingerprintComponents);
+    // Policy 1 predates this field. Omitting it for legacy licenses preserves
+    // their exact canonical bytes and therefore their existing signatures.
+    if (fingerprintPolicyVersion > 1) {
+        fingerprint.insert(QStringLiteral("policy_version"),
+                           fingerprintPolicyVersion);
+    }
 
     QJsonObject object;
     object.insert(QStringLiteral("version"), version);
     object.insert(QStringLiteral("license_id"), licenseId);
     object.insert(QStringLiteral("product"), product);
     object.insert(QStringLiteral("owner"), owner);
-    object.insert(QStringLiteral("issue_date"), issueDate.toUTC().toString(Qt::ISODate));
+    object.insert(QStringLiteral("issue_date"),
+                  issueDate.toUTC().toString(Qt::ISODate));
     object.insert(QStringLiteral("expiry_date"),
-                  expiryDate.isValid() ? expiryDate.toUTC().toString(Qt::ISODate) : QString());
+                  expiryDate.isValid()
+                      ? expiryDate.toUTC().toString(Qt::ISODate)
+                      : QString());
     object.insert(QStringLiteral("fingerprint"), fingerprint);
     object.insert(QStringLiteral("nonce"), nonce);
     return object;
@@ -75,6 +83,21 @@ bool License::fromJson(const QJsonObject& object) {
         || !fingerprint.value(QStringLiteral("components")).isArray()) {
         return false;
     }
+
+    fingerprintPolicyVersion = 1;
+    if (fingerprint.contains(QStringLiteral("policy_version"))) {
+        if (!fingerprint.value(QStringLiteral("policy_version")).isDouble()) {
+            return false;
+        }
+        const double policyValue =
+            fingerprint.value(QStringLiteral("policy_version")).toDouble();
+        fingerprintPolicyVersion = static_cast<int>(policyValue);
+        if (fingerprintPolicyVersion < 1
+            || policyValue != static_cast<double>(fingerprintPolicyVersion)) {
+            return false;
+        }
+    }
+
     fingerprintHash = fingerprint.value(QStringLiteral("hash")).toString().trimmed();
     fingerprintComponents = fingerprint.value(QStringLiteral("components")).toArray();
 

@@ -1,7 +1,6 @@
 #include "LicenseValidator.h"
 
 #include "CryptoManager.h"
-#include "HardwareFingerprint.h"
 
 #include <QDateTime>
 #include <QJsonDocument>
@@ -11,9 +10,13 @@
 
 namespace licensing {
 
-LicenseValidator::LicenseValidator(QByteArray publicKeyPem, QString expectedProduct)
+LicenseValidator::LicenseValidator(
+    QByteArray publicKeyPem,
+    QString expectedProduct,
+    FingerprintProvider fingerprintProvider)
     : m_publicKeyPem(std::move(publicKeyPem)),
-      m_expectedProduct(std::move(expectedProduct)) {
+      m_expectedProduct(std::move(expectedProduct)),
+      m_fingerprintProvider(std::move(fingerprintProvider)) {
 }
 
 QString LicenseValidator::errorToString(ValidationError error) const {
@@ -28,6 +31,13 @@ QString LicenseValidator::errorToString(ValidationError error) const {
         return QStringLiteral("The license signature is invalid.");
     case ValidationError::ProductMismatch:
         return QStringLiteral("This license belongs to a different product.");
+    case ValidationError::FingerprintPolicyUnsupported:
+        return QStringLiteral("The hardware fingerprint policy is not supported.");
+    case ValidationError::FingerprintInsufficient:
+        return QStringLiteral(
+            "Not enough reliable hardware identifiers are available for secure activation.");
+    case ValidationError::FingerprintInvalid:
+        return QStringLiteral("The signed hardware fingerprint is inconsistent or invalid.");
     case ValidationError::FingerprintMismatch:
         return QStringLiteral("This license is not valid for this machine.");
     case ValidationError::Expired:
@@ -87,29 +97,50 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
         return ValidationError::Expired;
     }
 
-    HardwareFingerprint currentFingerprint;
-    if (currentFingerprint.fingerprintHash() != license.fingerprintHash) {
-        QList<HardwareFingerprint::Component> referenceComponents;
-        for (const QJsonValue& value : license.fingerprintComponents) {
-            if (!value.isObject()) {
-                return ValidationError::MalformedPayload;
-            }
-            const QJsonObject object = value.toObject();
-            const QString name = object.value(QStringLiteral("name")).toString().trimmed();
-            const QString componentValue = object.value(QStringLiteral("value")).toString().trimmed();
-            if (name.isEmpty() || componentValue.isEmpty()) {
-                return ValidationError::MalformedPayload;
-            }
-            referenceComponents.append({
-                name,
-                componentValue,
-                object.value(QStringLiteral("stable")).toBool()
-            });
+    const int policyVersion = license.fingerprintPolicyVersion;
+    if (!HardwareFingerprint::isSupportedPolicy(policyVersion)) {
+        return ValidationError::FingerprintPolicyUnsupported;
+    }
+
+    QList<HardwareFingerprint::Component> referenceComponents;
+    QString componentError;
+    if (!HardwareFingerprint::parseComponents(license.fingerprintComponents,
+                                              policyVersion,
+                                              referenceComponents,
+                                              &componentError)) {
+        return ValidationError::MalformedPayload;
+    }
+
+    if (policyVersion == HardwareFingerprint::HardenedPolicyVersion) {
+        if (!HardwareFingerprint::hasSufficientIdentifiers(referenceComponents,
+                                                           policyVersion)) {
+            return ValidationError::FingerprintInsufficient;
         }
 
-        constexpr int hardwareChangeTolerance = 1;
-        if (!currentFingerprint.tolerantMatch(referenceComponents,
-                                              hardwareChangeTolerance)) {
+        const QString referenceHash = HardwareFingerprint::calculateHash(
+            referenceComponents, policyVersion);
+        if (referenceHash.isEmpty()
+            || referenceHash.compare(license.fingerprintHash,
+                                     Qt::CaseInsensitive) != 0) {
+            return ValidationError::FingerprintInvalid;
+        }
+    }
+
+    const HardwareFingerprint currentFingerprint = m_fingerprintProvider
+                                                       ? m_fingerprintProvider(policyVersion)
+                                                       : HardwareFingerprint(policyVersion);
+    if (policyVersion == HardwareFingerprint::HardenedPolicyVersion
+        && !currentFingerprint.isSufficient()) {
+        return ValidationError::FingerprintInsufficient;
+    }
+
+    if (currentFingerprint.fingerprintHash().compare(
+            license.fingerprintHash, Qt::CaseInsensitive) != 0) {
+        const HardwareFingerprint::MatchResult match =
+            currentFingerprint.match(
+                referenceComponents,
+                HardwareFingerprint::HardwareChangeTolerance);
+        if (!match.valid) {
             return ValidationError::FingerprintMismatch;
         }
     }

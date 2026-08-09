@@ -35,7 +35,7 @@ LicenseDialog::LicenseDialog(LicenseManager& manager, QWidget* parent)
     auto* fingerprintLayout = new QVBoxLayout(fingerprintGroup);
 
     const HardwareFingerprint fingerprint;
-    m_fingerprintHash = new QLabel(fingerprint.fingerprintHash(), fingerprintGroup);
+    m_fingerprintHash = new QLabel(fingerprintGroup);
     m_fingerprintHash->setWordWrap(true);
     m_fingerprintHash->setTextInteractionFlags(Qt::TextSelectableByMouse);
     fingerprintLayout->addWidget(new QLabel(tr("Fingerprint hash:"), fingerprintGroup));
@@ -47,6 +47,17 @@ LicenseDialog::LicenseDialog(LicenseManager& manager, QWidget* parent)
     fingerprintButtonRow->addStretch();
     fingerprintLayout->addLayout(fingerprintButtonRow);
     rootLayout->addWidget(fingerprintGroup);
+
+    if (fingerprint.isSufficient()) {
+        m_fingerprintHash->setText(fingerprint.fingerprintHash());
+    } else {
+        m_fingerprintHash->setText(
+            tr("Secure fingerprint unavailable: %1")
+                .arg(fingerprint.errorString()));
+        m_fingerprintHash->setStyleSheet(QStringLiteral("color: #b42318;"));
+        copyButton->setEnabled(false);
+        copyButton->setToolTip(fingerprint.errorString());
+    }
 
     auto* activationGroup = new QGroupBox(
         tr("Step 2: Paste the issued license key"), this);
@@ -79,6 +90,14 @@ License LicenseDialog::activatedLicense() const {
 
 void LicenseDialog::copyFingerprint() {
     const HardwareFingerprint fingerprint;
+    if (!fingerprint.isSufficient()) {
+        QMessageBox::critical(
+            this,
+            tr("Hardware fingerprint unavailable"),
+            fingerprint.errorString());
+        return;
+    }
+
     const QByteArray json = QJsonDocument(fingerprint.toJson())
                                 .toJson(QJsonDocument::Compact);
     QGuiApplication::clipboard()->setText(
