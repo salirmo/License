@@ -128,7 +128,8 @@ HardwareFingerprint HardwareFingerprint::fromComponents(
 
 bool HardwareFingerprint::isSupportedPolicy(int policyVersion) {
     return policyVersion == LegacyPolicyVersion
-           || policyVersion == HardenedPolicyVersion;
+           || policyVersion == HardenedPolicyVersion
+           || policyVersion == UnprivilegedPolicyVersion;
 }
 
 bool HardwareFingerprint::isBindingRole(ComponentRole role) {
@@ -167,7 +168,8 @@ HardwareFingerprint::ComponentRole HardwareFingerprint::componentRole(
         return ComponentRole::Unknown;
     }
 
-    if (policyVersion == HardenedPolicyVersion) {
+    if (policyVersion == HardenedPolicyVersion
+        || policyVersion == UnprivilegedPolicyVersion) {
         if (name == QStringLiteral("system_uuid")
             || name == QStringLiteral("board_serial")) {
             return ComponentRole::Strong;
@@ -193,7 +195,8 @@ QString HardwareFingerprint::normalizeValue(const QString& name,
     if (policyVersion == LegacyPolicyVersion) {
         return value.trimmed();
     }
-    if (policyVersion != HardenedPolicyVersion) {
+    if (policyVersion != HardenedPolicyVersion
+        && policyVersion != UnprivilegedPolicyVersion) {
         return {};
     }
 
@@ -239,7 +242,8 @@ bool HardwareFingerprint::isUsableValue(const QString& name,
     if (policyVersion == LegacyPolicyVersion) {
         return true;
     }
-    if (policyVersion != HardenedPolicyVersion
+    if ((policyVersion != HardenedPolicyVersion
+         && policyVersion != UnprivilegedPolicyVersion)
         || componentRole(name, policyVersion) == ComponentRole::Unknown) {
         return false;
     }
@@ -315,7 +319,8 @@ void HardwareFingerprint::refresh() {
                      ComponentRole::Informational);
         addComponent(QStringLiteral("os"), readOsInfo(),
                      ComponentRole::Informational);
-    } else if (m_policyVersion == HardenedPolicyVersion) {
+    } else if (m_policyVersion == HardenedPolicyVersion
+               || m_policyVersion == UnprivilegedPolicyVersion) {
         addComponent(QStringLiteral("system_uuid"), readSystemUuid(),
                      ComponentRole::Strong);
         addComponent(QStringLiteral("board_serial"), readBoardSerial(),
@@ -345,11 +350,38 @@ void HardwareFingerprint::finalize() {
         m_error = QStringLiteral("Unsupported hardware fingerprint policy.");
         return;
     }
-    if (m_policyVersion == HardenedPolicyVersion
+    if ((m_policyVersion == HardenedPolicyVersion
+         || m_policyVersion == UnprivilegedPolicyVersion)
         && !hasSufficientIdentifiers(m_components, m_policyVersion)) {
-        m_error = QStringLiteral(
-            "A secure fingerprint requires at least one strong identifier and "
-            "at least two total binding identifiers.");
+        int strongCount = 0;
+        int bindingCount = 0;
+        QSet<QString> bindingNames;
+        for (const Component& component : m_components) {
+            if (component.role == ComponentRole::Strong) {
+                ++strongCount;
+            }
+            if (isBindingRole(component.role)) {
+                ++bindingCount;
+                bindingNames.insert(component.name);
+            }
+        }
+        if (m_policyVersion == HardenedPolicyVersion) {
+            m_error = QStringLiteral(
+                "Fingerprint policy 2 requires at least one strong identifier "
+                "and at least two total binding identifiers. Found %1 strong "
+                "and %2 total binding identifiers.")
+                          .arg(strongCount)
+                          .arg(bindingCount);
+        } else {
+            const int requiredCount =
+                (bindingNames.contains(QStringLiteral("disk_serial")) ? 1 : 0)
+                + (bindingNames.contains(QStringLiteral("machine_id")) ? 1 : 0);
+            m_error = QStringLiteral(
+                "Fingerprint policy 3 requires an unprivileged root-disk "
+                "serial and Linux machine-id. Found %1 of 2 required "
+                "identifiers.")
+                          .arg(requiredCount);
+        }
         return;
     }
 
@@ -411,7 +443,8 @@ bool HardwareFingerprint::hasSufficientIdentifiers(
     if (policyVersion == LegacyPolicyVersion) {
         return true;
     }
-    if (policyVersion != HardenedPolicyVersion) {
+    if (policyVersion != HardenedPolicyVersion
+        && policyVersion != UnprivilegedPolicyVersion) {
         return false;
     }
 
@@ -428,14 +461,23 @@ bool HardwareFingerprint::hasSufficientIdentifiers(
             strongNames.insert(component.name);
         }
     }
-    return !strongNames.isEmpty()
-           && bindingNames.size() >= MinimumBindingIdentifiers;
+    if (policyVersion == HardenedPolicyVersion) {
+        return !strongNames.isEmpty()
+               && bindingNames.size() >= MinimumBindingIdentifiers;
+    }
+
+    // These two identifiers are readable by a normal Linux process. Requiring
+    // both makes policy-3 fingerprints device-specific without depending on a
+    // privileged DMI file or an administrator authorization dialog.
+    return bindingNames.contains(QStringLiteral("disk_serial"))
+           && bindingNames.contains(QStringLiteral("machine_id"));
 }
 
 QString HardwareFingerprint::calculateHash(const QList<Component>& components,
                                            int policyVersion) {
     if (!isSupportedPolicy(policyVersion)
-        || (policyVersion == HardenedPolicyVersion
+        || ((policyVersion == HardenedPolicyVersion
+             || policyVersion == UnprivilegedPolicyVersion)
             && !hasSufficientIdentifiers(components, policyVersion))) {
         return {};
     }
@@ -465,7 +507,8 @@ HardwareFingerprint::MatchResult HardwareFingerprint::evaluateMatch(
     if (!isSupportedPolicy(policyVersion) || tolerance < 0) {
         return result;
     }
-    if (policyVersion == HardenedPolicyVersion
+    if ((policyVersion == HardenedPolicyVersion
+         || policyVersion == UnprivilegedPolicyVersion)
         && (!hasSufficientIdentifiers(current, policyVersion)
             || !hasSufficientIdentifiers(reference, policyVersion))) {
         return result;
@@ -491,14 +534,22 @@ HardwareFingerprint::MatchResult HardwareFingerprint::evaluateMatch(
                 && currentComponent->role == ComponentRole::Strong) {
                 ++result.strongMatches;
             }
+        } else if (policyVersion == UnprivilegedPolicyVersion
+                   && (component.name == QStringLiteral("system_uuid")
+                       || component.name == QStringLiteral("board_serial"))
+                   && currentComponent == currentComponents.cend()) {
+            // DMI values are optional enhancements in policy 3. If Linux later
+            // hides them, losing permission must not invalidate the license.
+            continue;
         } else {
             ++result.mismatches;
         }
     }
 
-    const bool requiredMatch = policyVersion == LegacyPolicyVersion
-                                   ? result.bindingMatches > 0
-                                   : result.strongMatches > 0;
+    const bool requiredMatch =
+        policyVersion == HardenedPolicyVersion
+            ? result.strongMatches > 0
+            : result.bindingMatches > 0;
     result.valid = requiredMatch && result.mismatches <= tolerance;
     return result;
 }

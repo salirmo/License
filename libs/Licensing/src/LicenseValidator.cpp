@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include <cmath>
 #include <utility>
 
 namespace licensing {
@@ -27,6 +28,8 @@ QString LicenseValidator::errorToString(ValidationError error) const {
         return QStringLiteral("Invalid license key format.");
     case ValidationError::FormatUnsupported:
         return QStringLiteral("Unsupported license format.");
+    case ValidationError::LicenseVersionUnsupported:
+        return QStringLiteral("The license schema version is not supported.");
     case ValidationError::SignatureInvalid:
         return QStringLiteral("The license signature is invalid.");
     case ValidationError::ProductMismatch:
@@ -44,6 +47,8 @@ QString LicenseValidator::errorToString(ValidationError error) const {
         return QStringLiteral("The license has expired.");
     case ValidationError::NotYetValid:
         return QStringLiteral("The license issue date is in the future.");
+    case ValidationError::EntitlementsInvalid:
+        return QStringLiteral("The signed license entitlements are malformed.");
     case ValidationError::MalformedPayload:
         return QStringLiteral("The license payload is malformed.");
     }
@@ -52,6 +57,10 @@ QString LicenseValidator::errorToString(ValidationError error) const {
 
 ValidationError LicenseValidator::validateData(const QByteArray& data,
                                                License& outLicense) const {
+    // A failed validation must never leave previously validated entitlements
+    // available through a reused output object.
+    outLicense = License{};
+
     if (data.trimmed().isEmpty() || m_publicKeyPem.trimmed().isEmpty()) {
         return ValidationError::JsonParseFailed;
     }
@@ -73,12 +82,22 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
         return ValidationError::MalformedPayload;
     }
 
-    License license;
-    if (!license.fromJson(root.value(QStringLiteral("payload")).toObject())) {
-        return ValidationError::MalformedPayload;
+    const QJsonObject payload =
+        root.value(QStringLiteral("payload")).toObject();
+    const QJsonValue schemaVersion = payload.value(QStringLiteral("version"));
+    if (schemaVersion.isDouble()) {
+        const double versionValue = schemaVersion.toDouble();
+        if (std::isfinite(versionValue)
+            && std::floor(versionValue) == versionValue
+            && versionValue != License::LegacySchemaVersion
+            && versionValue != License::CurrentSchemaVersion) {
+            return ValidationError::LicenseVersionUnsupported;
+        }
     }
-    if (!m_expectedProduct.isEmpty() && license.product != m_expectedProduct) {
-        return ValidationError::ProductMismatch;
+
+    License license;
+    if (!license.fromJson(payload)) {
+        return ValidationError::MalformedPayload;
     }
 
     const QByteArray signature = QByteArray::fromBase64(
@@ -87,6 +106,10 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
         || !CryptoManager::verifyRsaSha256(
             license.canonical(), signature, m_publicKeyPem)) {
         return ValidationError::SignatureInvalid;
+    }
+
+    if (!m_expectedProduct.isEmpty() && license.product != m_expectedProduct) {
+        return ValidationError::ProductMismatch;
     }
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
@@ -111,7 +134,8 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
         return ValidationError::MalformedPayload;
     }
 
-    if (policyVersion == HardwareFingerprint::HardenedPolicyVersion) {
+    if (policyVersion == HardwareFingerprint::HardenedPolicyVersion
+        || policyVersion == HardwareFingerprint::UnprivilegedPolicyVersion) {
         if (!HardwareFingerprint::hasSufficientIdentifiers(referenceComponents,
                                                            policyVersion)) {
             return ValidationError::FingerprintInsufficient;
@@ -129,7 +153,8 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
     const HardwareFingerprint currentFingerprint = m_fingerprintProvider
                                                        ? m_fingerprintProvider(policyVersion)
                                                        : HardwareFingerprint(policyVersion);
-    if (policyVersion == HardwareFingerprint::HardenedPolicyVersion
+    if ((policyVersion == HardwareFingerprint::HardenedPolicyVersion
+         || policyVersion == HardwareFingerprint::UnprivilegedPolicyVersion)
         && !currentFingerprint.isSufficient()) {
         return ValidationError::FingerprintInsufficient;
     }
@@ -143,6 +168,11 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
         if (!match.valid) {
             return ValidationError::FingerprintMismatch;
         }
+    }
+
+    QString entitlementError;
+    if (!license.activateEntitlements(&entitlementError)) {
+        return ValidationError::EntitlementsInvalid;
     }
 
     outLicense = license;

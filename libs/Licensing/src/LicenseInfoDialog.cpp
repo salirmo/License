@@ -4,9 +4,12 @@
 #include "LicenseManager.h"
 
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPlainTextEdit>
 #include <QPushButton>
+#include <QStringList>
 #include <QVBoxLayout>
 
 namespace licensing {
@@ -16,6 +19,39 @@ QLineEdit* readOnlyField(QWidget* parent) {
     auto* field = new QLineEdit(parent);
     field->setReadOnly(true);
     return field;
+}
+
+QString limitText(const ResourceLimit& limit) {
+    return limit.unlimited ? QObject::tr("Unlimited")
+                           : QString::number(limit.value);
+}
+
+QString entitlementText(const License& license) {
+    if (!license.entitlementsAvailable()) {
+        return QObject::tr(
+            "Entitlement information is unavailable for this legacy license.");
+    }
+
+    QStringList lines;
+    lines.append(QObject::tr("Modules"));
+    const QList<LicensedModule> modules = license.licensedModules();
+    if (modules.isEmpty()) {
+        lines.append(QObject::tr("None"));
+    } else {
+        for (const LicensedModule& module : modules) {
+            lines.append(QString());
+            lines.append(module.displayName.isEmpty()
+                             ? module.id
+                             : module.displayName);
+            lines.append(QObject::tr("Module ID: %1").arg(module.id));
+            lines.append(QObject::tr("Camera Limit: %1")
+                             .arg(limitText(module.cameraLimit)));
+        }
+    }
+    lines.append(QString());
+    lines.append(QObject::tr("User Limit: %1")
+                     .arg(limitText(license.userLimit())));
+    return lines.join(QLatin1Char('\n'));
 }
 
 } // namespace
@@ -46,6 +82,14 @@ LicenseInfoDialog::LicenseInfoDialog(const LicenseManager& manager, QWidget* par
     formLayout->addRow(tr("Machine fingerprint:"), fingerprintField);
     rootLayout->addLayout(formLayout);
 
+    auto* entitlementsGroup = new QGroupBox(tr("Entitlements"), this);
+    auto* entitlementsLayout = new QVBoxLayout(entitlementsGroup);
+    auto* entitlementsField = new QPlainTextEdit(entitlementsGroup);
+    entitlementsField->setReadOnly(true);
+    entitlementsField->setMinimumHeight(180);
+    entitlementsLayout->addWidget(entitlementsField);
+    rootLayout->addWidget(entitlementsGroup);
+
     auto* closeButton = new QPushButton(tr("Close"), this);
     rootLayout->addWidget(closeButton, 0, Qt::AlignRight);
     connect(closeButton, &QPushButton::clicked,
@@ -68,6 +112,7 @@ LicenseInfoDialog::LicenseInfoDialog(const LicenseManager& manager, QWidget* par
                       QStringLiteral("yyyy-MM-dd hh:mm AP"))
                 : tr("Lifetime / perpetual"));
         fingerprintField->setText(license.fingerprintHash);
+        entitlementsField->setPlainText(entitlementText(license));
     } else {
         statusLabel->setText(tr("License is invalid: %1")
                                  .arg(manager.errorToString(error)));
@@ -77,6 +122,7 @@ LicenseInfoDialog::LicenseInfoDialog(const LicenseManager& manager, QWidget* par
                                  expiryField, fingerprintField}) {
             field->setText(tr("N/A"));
         }
+        entitlementsField->setPlainText(tr("N/A"));
     }
 }
 

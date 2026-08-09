@@ -48,6 +48,18 @@ QList<Component> hardenedComponents() {
     };
 }
 
+QList<Component> unprivilegedComponents() {
+    return {
+        secondary(QStringLiteral("disk_serial"), QStringLiteral("DISK-A-123")),
+        secondary(QStringLiteral("machine_id"),
+                  QStringLiteral("abcdef0123456789abcdef0123456789")),
+        informational(QStringLiteral("cpu_model"), QStringLiteral("Example CPU")),
+        informational(QStringLiteral("bios_version"), QStringLiteral("BIOS 1.0")),
+        informational(QStringLiteral("mac"), QStringLiteral("00:11:22:33:44:55")),
+        informational(QStringLiteral("os"), QStringLiteral("Example Linux;x86_64"))
+    };
+}
+
 QList<Component> legacyComponents() {
     return {
         secondary(QStringLiteral("mb_uuid"), QStringLiteral("BOARD-A-123")),
@@ -127,6 +139,9 @@ private slots:
     void linuxReinstall();
     void diskReplacement();
     void deterministicRootDiskSelection();
+    void unprivilegedFingerprintWithoutDmi();
+    void unprivilegedFingerprintIsDeviceSpecific();
+    void unprivilegedRepairTolerance();
     void motherboardReplacement();
     void differentPhysicalMachine();
     void oldLicenseWithNewClient();
@@ -563,6 +578,70 @@ void HardwareFingerprintTests::deterministicRootDiskSelection() {
                 .isEmpty());
 }
 
+void HardwareFingerprintTests::unprivilegedFingerprintWithoutDmi() {
+    const HardwareFingerprint fingerprint = HardwareFingerprint::fromComponents(
+        HardwareFingerprint::UnprivilegedPolicyVersion,
+        unprivilegedComponents());
+    QVERIFY(fingerprint.isSufficient());
+    QCOMPARE(fingerprint.policyVersion(), 3);
+    QVERIFY(validate(licenseFor(fingerprint), fingerprint)
+            == ValidationError::None);
+
+    const HardwareFingerprint missingDisk = HardwareFingerprint::fromComponents(
+        3, without(unprivilegedComponents(), QStringLiteral("disk_serial")));
+    QVERIFY(!missingDisk.isSufficient());
+    QVERIFY(missingDisk.errorString().contains(QStringLiteral("Found 1 of 2")));
+
+    const HardwareFingerprint changedDiagnostics =
+        HardwareFingerprint::fromComponents(
+            3, withValue(unprivilegedComponents(), QStringLiteral("cpu_model"),
+                         QStringLiteral("A Different CPU")));
+    QCOMPARE(changedDiagnostics.fingerprintHash(),
+             fingerprint.fingerprintHash());
+}
+
+void HardwareFingerprintTests::unprivilegedFingerprintIsDeviceSpecific() {
+    const HardwareFingerprint first = HardwareFingerprint::fromComponents(
+        3, unprivilegedComponents());
+    QList<Component> secondDevice = withValue(
+        unprivilegedComponents(), QStringLiteral("disk_serial"),
+        QStringLiteral("DISK-B-999"));
+    secondDevice = withValue(
+        secondDevice, QStringLiteral("machine_id"),
+        QStringLiteral("0123456789abcdef0123456789abcdef"));
+    const HardwareFingerprint second = HardwareFingerprint::fromComponents(
+        3, secondDevice);
+
+    QVERIFY(first.isSufficient());
+    QVERIFY(second.isSufficient());
+    QVERIFY(first.fingerprintHash() != second.fingerprintHash());
+    const auto result = second.match(first.components(), 1);
+    QCOMPARE(result.bindingMatches, 0);
+    QCOMPARE(result.mismatches, 2);
+    QVERIFY(!result.valid);
+    QVERIFY(validate(licenseFor(first), second)
+            == ValidationError::FingerprintMismatch);
+}
+
+void HardwareFingerprintTests::unprivilegedRepairTolerance() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        3, unprivilegedComponents());
+    const HardwareFingerprint replacedDisk = HardwareFingerprint::fromComponents(
+        3, withValue(unprivilegedComponents(), QStringLiteral("disk_serial"),
+                     QStringLiteral("DISK-B-999")));
+    const HardwareFingerprint reinstalledLinux =
+        HardwareFingerprint::fromComponents(
+            3, withValue(unprivilegedComponents(), QStringLiteral("machine_id"),
+                         QStringLiteral("0123456789abcdef0123456789abcdef")));
+
+    QCOMPARE(replacedDisk.match(reference.components(), 1).mismatches, 1);
+    QCOMPARE(reinstalledLinux.match(reference.components(), 1).mismatches, 1);
+    QVERIFY(validate(licenseFor(reference), replacedDisk)
+            == ValidationError::None);
+    QVERIFY(validate(licenseFor(reference), reinstalledLinux)
+            == ValidationError::None);
+}
+
 void HardwareFingerprintTests::motherboardReplacement() {
     const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
         2, hardenedComponents());
@@ -614,26 +693,26 @@ void HardwareFingerprintTests::oldLicenseWithNewClient() {
 
 void HardwareFingerprintTests::newFingerprintPolicyVersion() {
     const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
-        2, hardenedComponents());
+        HardwareFingerprint::CurrentPolicyVersion, unprivilegedComponents());
     License license = licenseFor(reference);
-    QCOMPARE(license.fingerprintPolicyVersion, 2);
+    QCOMPARE(license.fingerprintPolicyVersion, 3);
     QCOMPARE(license.toJson()
                  .value(QStringLiteral("fingerprint"))
                  .toObject()
                  .value(QStringLiteral("policy_version"))
                  .toInt(),
-             2);
+             3);
 
     License output;
     QVERIFY(validate(license, reference, &output) == ValidationError::None);
-    QCOMPARE(output.fingerprintPolicyVersion, 2);
+    QCOMPARE(output.fingerprintPolicyVersion, 3);
 }
 
 void HardwareFingerprintTests::unsupportedFingerprintPolicyVersion() {
     const HardwareFingerprint current = HardwareFingerprint::fromComponents(
         2, hardenedComponents());
     License license = licenseFor(current);
-    license.fingerprintPolicyVersion = 3;
+    license.fingerprintPolicyVersion = 4;
     QVERIFY(validate(license, current)
             == ValidationError::FingerprintPolicyUnsupported);
 }

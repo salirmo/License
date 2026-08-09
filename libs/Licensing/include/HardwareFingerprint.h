@@ -32,7 +32,10 @@ public:
 
     static constexpr int LegacyPolicyVersion = 1;
     static constexpr int HardenedPolicyVersion = 2;
-    static constexpr int CurrentPolicyVersion = HardenedPolicyVersion;
+    // Policy 3 keeps weak diagnostic values out of machine matching but can
+    // create a device-specific fingerprint without privileged DMI access.
+    static constexpr int UnprivilegedPolicyVersion = 3;
+    static constexpr int CurrentPolicyVersion = UnprivilegedPolicyVersion;
     static constexpr int HardwareChangeTolerance = 1;
     static constexpr int MinimumBindingIdentifiers = 2;
 

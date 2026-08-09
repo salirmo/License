@@ -14,6 +14,7 @@ enum class ValidationError {
     None,
     JsonParseFailed,
     FormatUnsupported,
+    LicenseVersionUnsupported,
     SignatureInvalid,
     ProductMismatch,
     FingerprintPolicyUnsupported,
@@ -22,6 +23,7 @@ enum class ValidationError {
     FingerprintMismatch,
     Expired,
     NotYetValid,
+    EntitlementsInvalid,
     MalformedPayload
 };
 

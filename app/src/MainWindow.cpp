@@ -4,12 +4,52 @@
 #include <LicenseManager.h>
 
 #include <QAction>
+#include <QGroupBox>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPlainTextEdit>
 #include <QStatusBar>
+#include <QStringList>
 #include <QVBoxLayout>
 #include <QWidget>
+
+namespace {
+
+QString limitText(const licensing::ResourceLimit& limit) {
+    return limit.unlimited ? QObject::tr("Unlimited")
+                           : QString::number(limit.value);
+}
+
+QString entitlementText(const licensing::License& license) {
+    if (!license.entitlementsAvailable()) {
+        return QObject::tr(
+            "Entitlement information is unavailable for this legacy license.");
+    }
+
+    QStringList lines;
+    lines.append(QObject::tr("Modules"));
+    const QList<licensing::LicensedModule> modules = license.licensedModules();
+    if (modules.isEmpty()) {
+        lines.append(QObject::tr("None"));
+    } else {
+        for (const licensing::LicensedModule& module : modules) {
+            lines.append(QString());
+            lines.append(module.displayName.isEmpty()
+                             ? module.id
+                             : module.displayName);
+            lines.append(QObject::tr("Module ID: %1").arg(module.id));
+            lines.append(QObject::tr("Camera Limit: %1")
+                             .arg(limitText(module.cameraLimit)));
+        }
+    }
+    lines.append(QString());
+    lines.append(QObject::tr("User Limit: %1")
+                     .arg(limitText(license.userLimit())));
+    return lines.join(QLatin1Char('\n'));
+}
+
+} // namespace
 
 MainWindow::MainWindow(const licensing::License& license,
                        const licensing::LicenseManager& licenseManager,
@@ -35,6 +75,15 @@ MainWindow::MainWindow(const licensing::License& license,
         centralWidget);
     licenseSummary->setAlignment(Qt::AlignCenter);
     layout->addWidget(licenseSummary);
+
+    auto* entitlementGroup = new QGroupBox(tr("Validated license entitlements"),
+                                           centralWidget);
+    auto* entitlementLayout = new QVBoxLayout(entitlementGroup);
+    auto* entitlementView = new QPlainTextEdit(entitlementGroup);
+    entitlementView->setReadOnly(true);
+    entitlementView->setPlainText(entitlementText(license));
+    entitlementLayout->addWidget(entitlementView);
+    layout->addWidget(entitlementGroup);
     layout->addStretch();
     setCentralWidget(centralWidget);
 
