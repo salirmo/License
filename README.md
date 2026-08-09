@@ -9,6 +9,105 @@ opens the activation dialog. The main window is only constructed after a stored
 or newly entered license validates successfully. Closing the activation dialog
 therefore exits the application without exposing the main window.
 
+## Hardware fingerprint policy
+
+New fingerprint requests use explicit **policy version 2**. The policy separates
+identifiers by what they are allowed to prove:
+
+| Component | Linux source | Role | Affects machine validity |
+| --- | --- | --- | --- |
+| `system_uuid` | `/sys/class/dmi/id/product_uuid` | Strong | Yes |
+| `board_serial` | `/sys/class/dmi/id/board_serial` | Strong | Yes |
+| `disk_serial` | Physical disk(s) backing the `/` filesystem | Secondary | Yes |
+| `machine_id` | `/etc/machine-id` | Secondary | Yes |
+| `cpu_model` | CPU model text from `/proc/cpuinfo` | Informational | No |
+| `bios_version` | `/sys/class/dmi/id/bios_version` | Informational | No |
+| `mac` | Active, non-loopback MAC addresses | Informational | No |
+| `os` | OS display name and CPU architecture | Informational | No |
+
+Strong and secondary values are binding identifiers. Informational values remain
+signed in license metadata for diagnostics, but they do not affect the hash,
+count as matches or mismatches, or affect validity. A CPU model, BIOS version,
+MAC address, or OS value can never independently prove that this is the licensed
+machine.
+
+Policy 2 refuses to create or accept a secure fingerprint unless it contains:
+
+- At least one usable strong identifier; and
+- At least two total usable binding identifiers.
+
+Empty values and common firmware placeholders such as `Unknown`, `Default
+String`, all-zero/all-`f` values, and `To Be Filled By O.E.M.` are discarded and
+cannot strengthen a match. Binding identifiers are trimmed, case-normalized, and
+format-normalized before hashing and comparison. UUID and machine-ID formats are
+validated strictly.
+
+### Exact and tolerant matching
+
+The policy-2 fingerprint hash is built only from normalized strong and secondary
+components. Each `name:value` pair is SHA-256 hashed, those digests are sorted,
+joined, and SHA-256 hashed again.
+
+Validation first checks the signed component schema, minimum identifier count,
+and that the signed hash really corresponds to the signed components. It then
+compares the current fingerprint:
+
+1. An exact fingerprint hash match is valid.
+2. Otherwise, individual signed binding components are compared by name and
+   normalized value.
+3. At least one **strong** identifier must match.
+4. At most one signed binding component may be changed or missing.
+5. Components newly collected by a newer client are ignored when validating an
+   older signed reference.
+
+The one-component tolerance permits a normal disk replacement or Linux reinstall
+while a strong physical identifier still matches. Secondary or informational
+values alone can never validate a different machine.
+
+| Change | Policy-2 result |
+| --- | --- |
+| No hardware change | Valid |
+| MAC/network change | Valid; informational only |
+| BIOS update | Valid; informational only |
+| CPU replacement or CPU-model change | Valid; informational only |
+| Disk replacement | Valid as one secondary mismatch when a strong ID matches |
+| Linux reinstall changing `/etc/machine-id` | Valid as one secondary mismatch when a strong ID matches |
+| Motherboard replacement | Normally invalid because both strong identifiers change |
+| Any two binding identifiers change or disappear | Invalid |
+| Only secondary identifiers match | Invalid because no strong identifier matches |
+| Different physical machine | Invalid in normal hardware configurations |
+
+“Valid” in this table covers the hardware decision only. Format, product,
+signature, issue-date, and expiration checks must also pass.
+
+### Deterministic root-disk identity
+
+Policy 2 no longer selects the first disk returned by `lsblk`. It parses
+`lsblk --json --paths --output NAME,TYPE,SERIAL,MOUNTPOINT`, finds the device
+mounted at `/`, walks its tree to the physical disk ancestor, and uses only that
+disk serial. If multiple physical disks back the root filesystem, their
+normalized serials are sorted and combined deterministically as one secondary
+component. A missing or default serial is omitted safely.
+
+### Fingerprint policy compatibility
+
+- A signed fingerprint containing `policy_version: 2` uses the hardened rules
+  above.
+- A license with no fingerprint policy field is interpreted as legacy policy 1.
+- Policy 1 reconstructs the original component names (`mb_uuid`, `bios_serial`,
+  `machine_guid`, and `cpu_id`), original first-disk behavior, original hash, and
+  original one-mismatch matching rule. This preserves existing signatures and
+  already-issued licenses.
+- The updated generator issues only policy-2 licenses. It rejects old, empty,
+  insufficient, inconsistent, or default-filled fingerprint requests.
+- Unsupported future policy versions are rejected explicitly rather than being
+  interpreted using the wrong rules.
+
+Legacy policy 1 remains less secure because its historical matching rule allows
+any old `stable: true` component to provide the required match. It is retained
+only for existing-license compatibility; reissuing licenses under policy 2 is
+recommended.
+
 ## Build
 
 Requirements:
@@ -21,6 +120,15 @@ Requirements:
 cmake -S . -B build
 cmake --build build
 ./build/app/License
+```
+
+Run the automated policy and compatibility tests with:
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build
+cd build
+ctest --output-on-failure
 ```
 
 ## Configure your product
