@@ -10,5 +10,12 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(OpenSSL REQUIRED)
 
+include(CTest)
+
 add_subdirectory(libs/Licensing)
 add_subdirectory(app)
+
+if(BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    add_subdirectory(tests)
+endif()
