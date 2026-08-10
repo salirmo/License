@@ -39,6 +39,10 @@ QString LicenseValidator::errorToString(ValidationError error) const {
     case ValidationError::FingerprintInsufficient:
         return QStringLiteral(
             "Not enough reliable hardware identifiers are available for secure activation.");
+    case ValidationError::PlatformIdentityUnavailable:
+        return QStringLiteral(
+            "The signed platform identity is unavailable on this boot. "
+            "Refresh the trusted hardware snapshot or reactivate the license.");
     case ValidationError::FingerprintInvalid:
         return QStringLiteral("The signed hardware fingerprint is inconsistent or invalid.");
     case ValidationError::FingerprintMismatch:
@@ -135,7 +139,8 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
     }
 
     if (policyVersion == HardwareFingerprint::HardenedPolicyVersion
-        || policyVersion == HardwareFingerprint::UnprivilegedPolicyVersion) {
+        || policyVersion == HardwareFingerprint::UnprivilegedPolicyVersion
+        || policyVersion == HardwareFingerprint::PlatformPolicyVersion) {
         if (!HardwareFingerprint::hasSufficientIdentifiers(referenceComponents,
                                                            policyVersion)) {
             return ValidationError::FingerprintInsufficient;
@@ -166,6 +171,18 @@ ValidationError LicenseValidator::validateData(const QByteArray& data,
                 referenceComponents,
                 HardwareFingerprint::HardwareChangeTolerance);
         if (!match.valid) {
+            if (policyVersion == HardwareFingerprint::PlatformPolicyVersion) {
+                if (match.referenceHasPlatform
+                    && match.platformState
+                           == HardwareFingerprint::EvidenceState::Unavailable) {
+                    return ValidationError::PlatformIdentityUnavailable;
+                }
+                if (!match.referenceHasPlatform
+                    && match.secondaryState
+                           == HardwareFingerprint::EvidenceState::Unavailable) {
+                    return ValidationError::FingerprintInsufficient;
+                }
+            }
             return ValidationError::FingerprintMismatch;
         }
     }

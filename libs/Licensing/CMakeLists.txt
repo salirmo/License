@@ -10,6 +10,9 @@ target_sources(Licensing
         src/LicenseInfoDialog.cpp
         src/LicenseManager.cpp
         src/LicenseValidator.cpp
+        src/PlatformIdentity.cpp
+        src/PlatformIdentityCore.cpp
+        src/PlatformIdentityCore.h
         include/CryptoManager.h
         include/HardwareFingerprint.h
         include/License.h
@@ -17,6 +20,7 @@ target_sources(Licensing
         include/LicenseInfoDialog.h
         include/LicenseManager.h
         include/LicenseValidator.h
+        include/PlatformIdentity.h
         include/PubKey.h
 )
 

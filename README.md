@@ -10,9 +10,107 @@ only constructed after a stored or newly entered license validates
 successfully. Closing the activation dialog therefore exits the application
 without exposing the main window or entitlement data.
 
-## Hardware fingerprint policy
+## Current hardware fingerprint policy 4
 
-New fingerprint requests use explicit **policy version 3**. It produces a
+New fingerprint requests and newly issued licenses use **policy version 4**.
+The policy identifies the physical platform first, so replacing the root disk,
+reinstalling Linux, or doing both does not invalidate a license while the same
+motherboard/system identity remains.
+
+| Component | Linux source | Policy-4 role | Enters hash/matching |
+| --- | --- | --- | --- |
+| `product_uuid` | `/sys/class/dmi/id/product_uuid` | Platform (preferred) | Yes |
+| `product_serial` | `/sys/class/dmi/id/product_serial` | Platform | Yes |
+| `board_serial` | `/sys/class/dmi/id/board_serial` | Platform | Yes |
+| `permanent_mac` | rtnetlink `IFLA_PERM_ADDRESS` on physical interfaces | Secondary | Yes |
+| `derived_machine_id` | Application-specific HMAC derivation of `/etc/machine-id` | Secondary | Yes |
+| `disk_serial` | Physical disk(s) backing `/` | Secondary | Yes |
+| `cpu_model` | `/proc/cpuinfo` | Informational | No |
+| `bios_version` | `/sys/class/dmi/id/bios_version` | Informational | No |
+| `os` | Qt OS description and architecture | Informational | No |
+
+The three DMI values form one correlated **platform evidence group**. They are
+not three independent votes. A matching valid `product_uuid` confirms the
+platform. When product UUID is unavailable, both `product_serial` and
+`board_serial` must be present and match to confirm the platform. Malformed
+UUIDs, empty/default/all-zero/all-`f` serials, `unknown`, `default string`, and
+other firmware placeholders are discarded.
+
+Only platform and secondary components enter the deterministic SHA-256
+fingerprint hash. Exact hash equality remains the fast path. When the hash
+changes, component-aware policy-4 matching is authoritative:
+
+1. A matching signed/current `product_uuid` confirms the platform, regardless
+   of secondary changes.
+2. Without a comparable UUID, an exact signed/current product-serial and
+   board-serial pair confirms the platform.
+3. A comparable but different platform identity rejects the license even when
+   the old disk and Linux installation still match.
+4. If a trustworthy platform group was signed but is now unavailable, the
+   validator returns `PlatformIdentityUnavailable`; it never downgrades to
+   secondary matching.
+5. Only a license issued with no platform group may use fallback matching. It
+   requires at least two independent secondary matches and allows at most one
+   secondary mismatch. A single secondary match is never enough.
+
+Policy 4 explicitly represents evidence as `Match`, `Mismatch`, or
+`Unavailable`. Missing evidence is not treated as changed evidence.
+
+The raw `/etc/machine-id` is never emitted in a policy-4 request or license. The
+library validates the 128-bit machine ID and derives a stable application-
+specific 256-bit value with HMAC-SHA-256. Permanent MAC collection accepts only
+Linux rtnetlink `IFLA_PERM_ADDRESS`; it does not silently substitute the current
+or randomized `IFLA_ADDRESS`. Loopback, software-created interfaces, malformed
+addresses, multicast/broadcast addresses, and duplicates are ignored. Multiple
+usable permanent addresses are normalized, sorted, and combined as one
+secondary component.
+
+### Policy-4 invalidation matrix
+
+| Change | Result | Reason |
+| --- | --- | --- |
+| OS/kernel/hostname update | Valid | Not platform evidence; OS is informational and hostname is not collected |
+| BIOS version update | Valid | BIOS version is informational, unless real platform IDs also change |
+| CPU replacement | Valid | CPU model is informational |
+| Add a non-root disk | Valid | It is not part of root-disk identity |
+| Replace root SSD | Valid with matching platform | Disk is secondary |
+| Fresh Linux installation | Valid with matching platform | Derived machine ID is secondary |
+| Replace root SSD and reinstall Linux | Valid with matching platform | Matching platform overrides secondary changes |
+| Replace network adapter/permanent MAC | Valid with matching platform | Permanent MAC is secondary |
+| Move the old SSD/OS to another computer | Invalid | Comparable platform identity changed |
+| Clone the disk/OS to another physical computer | Invalid | Comparable platform identity changed |
+| Replace motherboard/platform | Invalid/reissue required | Primary physical identity changed |
+| Signed platform later becomes unavailable | Fail closed | No fallback downgrade is allowed |
+| No platform at issuance; one secondary match | Invalid/insufficient | At least two matches are required |
+| No platform at issuance; two matches and at most one mismatch | Valid | Meets the explicit fallback rule |
+
+“Valid” describes the hardware decision only. Signature, product, dates,
+license schema, and entitlements must also validate.
+
+### Privileged DMI snapshot
+
+The Qt application always runs unprivileged. When DMI files are directly
+readable it uses them directly. For systems where DMI is root-readable only,
+the project installs the minimal `sgi-license-hardware-identity` systemd
+oneshot helper. It runs once during boot and atomically publishes:
+
+```text
+/var/lib/sgi-license/platform-identity.json
+```
+
+The library accepts the snapshot only when its file and parent directory are
+root-owned and not group/other-writable, its format/version is valid, and its
+signed-in snapshot boot ID matches `/proc/sys/kernel/random/boot_id` for the
+current boot. A stale snapshot copied with a disk image is rejected. See
+[`HARDWARE_IDENTITY_HELPER.md`](HARDWARE_IDENTITY_HELPER.md) for installation
+and operations. Development builds also expose an **Initialize hardware
+identity** button when a snapshot is required. It invokes only the
+automatically built helper through PolicyKit; the Qt application and Qt Creator
+remain unprivileged.
+
+## Legacy fingerprint policy 3 compatibility
+
+Already-issued policy-3 licenses use explicit **policy version 3**. It produces a
 device-specific fingerprint as a normal Linux user and never asks for root or
 PolicyKit authorization. Identifiers remain separated by their role:
 
@@ -112,14 +210,14 @@ component. A missing or default serial is omitted safely.
   `machine_guid`, and `cpu_id`), original first-disk behavior, original hash, and
   original one-mismatch matching rule. This preserves existing signatures and
   already-issued licenses.
-- The updated generator issues only policy-3 licenses. It rejects old, empty,
+- The updated generator issues only policy-4 licenses. It rejects old, empty,
   insufficient, inconsistent, or default-filled fingerprint requests.
 - Unsupported future policy versions are rejected explicitly rather than being
   interpreted using the wrong rules.
 
 Legacy policy 1 remains less secure because its historical matching rule allows
 any old `stable: true` component to provide the required match. It is retained
-only for existing-license compatibility. Reissue older licenses under policy 3
+only for existing-license compatibility. Reissue older licenses under policy 4
 when password-free collection is required.
 
 Policy 3 deliberately trades guaranteed motherboard detection for unprivileged
@@ -285,7 +383,7 @@ License schema and fingerprint policy are versioned independently:
   `entitlementsAvailable() == false`, enables no modules, and invents no limits.
 - Schema 2 licenses require a valid signed `modules` array and `user_limit`.
   An empty array is valid and explicitly licenses no modules.
-- `fingerprint.policy_version` still independently selects policy 1, 2, or 3
+- `fingerprint.policy_version` still independently selects policy 1, 2, 3, or 4
   hardware behavior. Entitlement schema changes do not reinterpret it.
 - The transport envelope remains `acme-license-1`; unsupported future payload
   schema versions are rejected explicitly.
@@ -299,7 +397,7 @@ integrating the same API into the real host application.
 Requirements:
 
 - CMake 3.16 or newer
-- Qt 6 (`Widgets` and `Network`)
+- Qt 6 (`Core`, `Widgets`, and `Network`)
 - OpenSSL development files
 
 ```bash

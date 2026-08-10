@@ -1,5 +1,6 @@
 #include <HardwareFingerprint.h>
 #include <LicenseValidator.h>
+#include <PlatformIdentity.h>
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -14,6 +15,9 @@
 using licensing::HardwareFingerprint;
 using licensing::License;
 using licensing::LicenseValidator;
+using licensing::PlatformIdentity;
+using licensing::PlatformIdentityValues;
+using licensing::SnapshotStatus;
 using licensing::ValidationError;
 
 namespace {
@@ -23,6 +27,10 @@ using Role = HardwareFingerprint::ComponentRole;
 
 Component strong(const QString& name, const QString& value) {
     return {name, value, Role::Strong};
+}
+
+Component platform(const QString& name, const QString& value) {
+    return {name, value, Role::Platform};
 }
 
 Component secondary(const QString& name, const QString& value) {
@@ -56,6 +64,46 @@ QList<Component> unprivilegedComponents() {
         informational(QStringLiteral("cpu_model"), QStringLiteral("Example CPU")),
         informational(QStringLiteral("bios_version"), QStringLiteral("BIOS 1.0")),
         informational(QStringLiteral("mac"), QStringLiteral("00:11:22:33:44:55")),
+        informational(QStringLiteral("os"), QStringLiteral("Example Linux;x86_64"))
+    };
+}
+
+QString derivedIdA() {
+    return QStringLiteral(
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+}
+
+QString derivedIdB() {
+    return QStringLiteral(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+}
+
+QList<Component> platformComponents() {
+    return {
+        platform(QStringLiteral("product_uuid"),
+                 QStringLiteral("11111111-2222-3333-4444-555555555555")),
+        platform(QStringLiteral("product_serial"),
+                 QStringLiteral("PRODUCT-A-123")),
+        platform(QStringLiteral("board_serial"),
+                 QStringLiteral("BOARD-A-123")),
+        secondary(QStringLiteral("permanent_mac"),
+                  QStringLiteral("00:11:22:33:44:55")),
+        secondary(QStringLiteral("derived_machine_id"), derivedIdA()),
+        secondary(QStringLiteral("disk_serial"), QStringLiteral("DISK-A-123")),
+        informational(QStringLiteral("cpu_model"), QStringLiteral("Example CPU")),
+        informational(QStringLiteral("bios_version"), QStringLiteral("BIOS 1.0")),
+        informational(QStringLiteral("os"), QStringLiteral("Example Linux;x86_64"))
+    };
+}
+
+QList<Component> fallbackComponents() {
+    return {
+        secondary(QStringLiteral("permanent_mac"),
+                  QStringLiteral("00:11:22:33:44:55")),
+        secondary(QStringLiteral("derived_machine_id"), derivedIdA()),
+        secondary(QStringLiteral("disk_serial"), QStringLiteral("DISK-A-123")),
+        informational(QStringLiteral("cpu_model"), QStringLiteral("Example CPU")),
+        informational(QStringLiteral("bios_version"), QStringLiteral("BIOS 1.0")),
         informational(QStringLiteral("os"), QStringLiteral("Example Linux;x86_64"))
     };
 }
@@ -148,6 +196,19 @@ private slots:
     void newFingerprintPolicyVersion();
     void unsupportedFingerprintPolicyVersion();
     void malformedAndDefaultIdentifiers();
+    void platformPolicyClassifiesComponents();
+    void platformIdentityMaintenanceChanges();
+    void productUuidIsPrimaryPlatformIdentity();
+    void serialPairConfirmsPlatformWithoutUuid();
+    void movedOrClonedSystemIsRejected();
+    void missingSignedPlatformFailsClosed();
+    void fallbackRequiresTwoMatches();
+    void fallbackAcceptsTwoMatchesAndOneMismatch();
+    void derivedMachineIdIsApplicationSpecific();
+    void permanentMacNormalization();
+    void staleHardwareSnapshotRejected();
+    void policyFourRejectsMalformedPlatformValues();
+    void editedPolicyFourLicenseHasInvalidSignature();
 
 private:
     License licenseFor(const HardwareFingerprint& reference) const;
@@ -693,26 +754,26 @@ void HardwareFingerprintTests::oldLicenseWithNewClient() {
 
 void HardwareFingerprintTests::newFingerprintPolicyVersion() {
     const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
-        HardwareFingerprint::CurrentPolicyVersion, unprivilegedComponents());
+        HardwareFingerprint::CurrentPolicyVersion, platformComponents());
     License license = licenseFor(reference);
-    QCOMPARE(license.fingerprintPolicyVersion, 3);
+    QCOMPARE(license.fingerprintPolicyVersion, 4);
     QCOMPARE(license.toJson()
                  .value(QStringLiteral("fingerprint"))
                  .toObject()
                  .value(QStringLiteral("policy_version"))
                  .toInt(),
-             3);
+             4);
 
     License output;
     QVERIFY(validate(license, reference, &output) == ValidationError::None);
-    QCOMPARE(output.fingerprintPolicyVersion, 3);
+    QCOMPARE(output.fingerprintPolicyVersion, 4);
 }
 
 void HardwareFingerprintTests::unsupportedFingerprintPolicyVersion() {
     const HardwareFingerprint current = HardwareFingerprint::fromComponents(
         2, hardenedComponents());
     License license = licenseFor(current);
-    license.fingerprintPolicyVersion = 4;
+    license.fingerprintPolicyVersion = 5;
     QVERIFY(validate(license, current)
             == ValidationError::FingerprintPolicyUnsupported);
 }
@@ -743,6 +804,336 @@ void HardwareFingerprintTests::malformedAndDefaultIdentifiers() {
     const HardwareFingerprint current = HardwareFingerprint::fromComponents(
         2, hardenedComponents());
     QVERIFY(validate(license, current) == ValidationError::MalformedPayload);
+}
+
+void HardwareFingerprintTests::platformPolicyClassifiesComponents() {
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("product_uuid"), 4),
+             Role::Platform);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("product_serial"), 4),
+             Role::Platform);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("board_serial"), 4),
+             Role::Platform);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("permanent_mac"), 4),
+             Role::Secondary);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("derived_machine_id"), 4),
+             Role::Secondary);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("disk_serial"), 4),
+             Role::Secondary);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("cpu_model"), 4),
+             Role::Informational);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("bios_version"), 4),
+             Role::Informational);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("os"), 4),
+             Role::Informational);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("machine_id"), 4),
+             Role::Unknown);
+    QCOMPARE(HardwareFingerprint::componentRole(
+                 QStringLiteral("mac"), 4),
+             Role::Unknown);
+}
+
+void HardwareFingerprintTests::platformIdentityMaintenanceChanges() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    QVERIFY(reference.isSufficient());
+    const License license = licenseFor(reference);
+
+    QList<Component> changed = withValue(
+        platformComponents(), QStringLiteral("os"),
+        QStringLiteral("New Linux Kernel and Distribution;x86_64"));
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None); // OS/kernel update
+
+    // Hostname and non-root disks are not fingerprint components.
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(
+                                  4, platformComponents())),
+             ValidationError::None);
+
+    changed = withValue(platformComponents(), QStringLiteral("bios_version"),
+                        QStringLiteral("BIOS 2.0"));
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None);
+
+    changed = withValue(platformComponents(), QStringLiteral("cpu_model"),
+                        QStringLiteral("Replacement CPU"));
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None);
+
+    changed = withValue(platformComponents(), QStringLiteral("disk_serial"),
+                        QStringLiteral("DISK-B-999"));
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None); // Root SSD replacement
+
+    changed = withValue(platformComponents(), QStringLiteral("derived_machine_id"),
+                        derivedIdB());
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None); // Fresh Linux installation
+
+    changed = withValue(platformComponents(), QStringLiteral("disk_serial"),
+                        QStringLiteral("DISK-B-999"));
+    changed = withValue(changed, QStringLiteral("derived_machine_id"),
+                        derivedIdB());
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None); // New root SSD plus fresh Linux
+
+    changed = withValue(platformComponents(), QStringLiteral("permanent_mac"),
+                        QStringLiteral("00:aa:bb:cc:dd:ee"));
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None); // Network adapter/permanent MAC replacement
+}
+
+void HardwareFingerprintTests::productUuidIsPrimaryPlatformIdentity() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    QList<Component> changed = withValue(
+        platformComponents(), QStringLiteral("product_serial"),
+        QStringLiteral("PRODUCT-FIRMWARE-CHANGED"));
+    changed = withValue(changed, QStringLiteral("board_serial"),
+                        QStringLiteral("BOARD-FIRMWARE-CHANGED"));
+    changed = withValue(changed, QStringLiteral("disk_serial"),
+                        QStringLiteral("DISK-B-999"));
+    changed = withValue(changed, QStringLiteral("derived_machine_id"),
+                        derivedIdB());
+    changed = withValue(changed, QStringLiteral("permanent_mac"),
+                        QStringLiteral("00:aa:bb:cc:dd:ee"));
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, changed);
+    const auto result = current.match(reference.components(), 1);
+    QCOMPARE(result.platformState,
+             HardwareFingerprint::EvidenceState::Match);
+    QCOMPARE(validate(licenseFor(reference), current), ValidationError::None);
+}
+
+void HardwareFingerprintTests::serialPairConfirmsPlatformWithoutUuid() {
+    const QList<Component> pairComponents = without(
+        platformComponents(), QStringLiteral("product_uuid"));
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, pairComponents);
+    QVERIFY(reference.isSufficient());
+
+    QList<Component> changed = withValue(
+        pairComponents, QStringLiteral("disk_serial"),
+        QStringLiteral("DISK-B-999"));
+    changed = withValue(changed, QStringLiteral("derived_machine_id"),
+                        derivedIdB());
+    QCOMPARE(validate(licenseFor(reference),
+                      HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None);
+
+    changed = withValue(pairComponents, QStringLiteral("board_serial"),
+                        QStringLiteral("BOARD-B-999"));
+    QCOMPARE(validate(licenseFor(reference),
+                      HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::FingerprintMismatch);
+}
+
+void HardwareFingerprintTests::movedOrClonedSystemIsRejected() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    const License license = licenseFor(reference);
+
+    QList<Component> changed = withValue(
+        platformComponents(), QStringLiteral("product_uuid"),
+        QStringLiteral("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    changed = withValue(changed, QStringLiteral("product_serial"),
+                        QStringLiteral("PRODUCT-B-999"));
+    changed = withValue(changed, QStringLiteral("board_serial"),
+                        QStringLiteral("BOARD-B-999"));
+    const HardwareFingerprint movedDisk = HardwareFingerprint::fromComponents(
+        4, changed);
+    QCOMPARE(validate(license, movedDisk), ValidationError::FingerprintMismatch);
+
+    // The disk serial and derived OS identity still match here, as they would
+    // for a moved or cloned installation, but changed platform identity wins.
+    const auto result = movedDisk.match(reference.components(), 1);
+    QCOMPARE(result.platformState,
+             HardwareFingerprint::EvidenceState::Mismatch);
+    QVERIFY(!result.valid);
+
+    // A motherboard/platform replacement has the same fail-closed outcome.
+    QCOMPARE(validate(license, HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::FingerprintMismatch);
+}
+
+void HardwareFingerprintTests::missingSignedPlatformFailsClosed() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, fallbackComponents());
+    QVERIFY(current.isSufficient());
+    const auto result = current.match(reference.components(), 1);
+    QCOMPARE(result.platformState,
+             HardwareFingerprint::EvidenceState::Unavailable);
+    QCOMPARE(validate(licenseFor(reference), current),
+             ValidationError::PlatformIdentityUnavailable);
+}
+
+void HardwareFingerprintTests::fallbackRequiresTwoMatches() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, fallbackComponents());
+    const QList<Component> onlyOneMatch = {
+        secondary(QStringLiteral("permanent_mac"),
+                  QStringLiteral("00:11:22:33:44:55")),
+        informational(QStringLiteral("os"), QStringLiteral("Example Linux;x86_64"))
+    };
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, onlyOneMatch);
+    const auto result = current.match(reference.components(), 1);
+    QCOMPARE(result.secondaryMatches, 1);
+    QCOMPARE(result.secondaryState,
+             HardwareFingerprint::EvidenceState::Unavailable);
+    QCOMPARE(validate(licenseFor(reference), current),
+             ValidationError::FingerprintInsufficient);
+}
+
+void HardwareFingerprintTests::fallbackAcceptsTwoMatchesAndOneMismatch() {
+    const HardwareFingerprint reference = HardwareFingerprint::fromComponents(
+        4, fallbackComponents());
+    QList<Component> changed = withValue(
+        fallbackComponents(), QStringLiteral("disk_serial"),
+        QStringLiteral("DISK-B-999"));
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, changed);
+    const auto result = current.match(reference.components(), 1);
+    QCOMPARE(result.secondaryMatches, 2);
+    QCOMPARE(result.secondaryMismatches, 1);
+    QCOMPARE(result.secondaryState, HardwareFingerprint::EvidenceState::Match);
+    QCOMPARE(validate(licenseFor(reference), current), ValidationError::None);
+
+    changed = without(fallbackComponents(), QStringLiteral("disk_serial"));
+    QCOMPARE(validate(licenseFor(reference),
+                      HardwareFingerprint::fromComponents(4, changed)),
+             ValidationError::None);
+}
+
+void HardwareFingerprintTests::derivedMachineIdIsApplicationSpecific() {
+    const QString raw = QStringLiteral("abcdef0123456789abcdef0123456789");
+    const QString derived = HardwareFingerprint::deriveApplicationMachineId(raw);
+    QCOMPARE(derived.size(), 64);
+    QCOMPARE(derived, HardwareFingerprint::deriveApplicationMachineId(raw));
+    QVERIFY(derived != raw);
+    QVERIFY(!derived.contains(raw));
+    QVERIFY(HardwareFingerprint::deriveApplicationMachineId(
+                QStringLiteral("00000000000000000000000000000000"))
+                .isEmpty());
+    const HardwareFingerprint placeholder = HardwareFingerprint::fromComponents(
+        4,
+        {secondary(QStringLiteral("permanent_mac"),
+                   QStringLiteral("00:11:22:33:44:55")),
+         secondary(QStringLiteral("derived_machine_id"),
+                   QString(64, QLatin1Char('0')))});
+    QVERIFY(!placeholder.isSufficient());
+    QCOMPARE(HardwareFingerprint::componentRole(QStringLiteral("machine_id"), 4),
+             Role::Unknown);
+}
+
+void HardwareFingerprintTests::permanentMacNormalization() {
+    const QString normalized =
+        HardwareFingerprint::normalizePermanentMacAddresses({
+            QStringLiteral("66-77-88-99-AA-BB"),
+            QStringLiteral("00:11:22:33:44:55"),
+            QStringLiteral("00:11:22:33:44:55"),
+            QStringLiteral("01:00:5e:00:00:01"), // multicast
+            QStringLiteral("ff:ff:ff:ff:ff:ff"),
+            QStringLiteral("not-a-mac")
+        });
+    QCOMPARE(normalized,
+             QStringLiteral("00:11:22:33:44:55,66:77:88:99:aa:bb"));
+}
+
+void HardwareFingerprintTests::staleHardwareSnapshotRejected() {
+    PlatformIdentityValues values;
+    values.productUuid =
+        QStringLiteral("11111111-2222-3333-4444-555555555555");
+    values.productSerial = QStringLiteral("product-a-123");
+    values.boardSerial = QStringLiteral("board-a-123");
+    const QString firstBoot =
+        QStringLiteral("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    const QString nextBoot =
+        QStringLiteral("01234567-89ab-cdef-0123-456789abcdef");
+    QString error;
+    const QByteArray snapshot = PlatformIdentity::createSnapshot(
+        values, firstBoot, &error);
+    QVERIFY2(!snapshot.isEmpty(), qPrintable(error));
+
+    PlatformIdentityValues parsed;
+    QCOMPARE(PlatformIdentity::parseSnapshot(snapshot, firstBoot, parsed, &error),
+             SnapshotStatus::Valid);
+    QCOMPARE(parsed.productUuid, values.productUuid);
+
+    error.clear();
+    QCOMPARE(PlatformIdentity::parseSnapshot(snapshot, nextBoot, parsed, &error),
+             SnapshotStatus::Stale);
+    QVERIFY(error.contains(QStringLiteral("previous Linux boot")));
+}
+
+void HardwareFingerprintTests::policyFourRejectsMalformedPlatformValues() {
+    const QList<Component> incomplete = {
+        platform(QStringLiteral("product_serial"),
+                 QStringLiteral("PRODUCT-A-123")),
+        secondary(QStringLiteral("derived_machine_id"), derivedIdA()),
+        secondary(QStringLiteral("disk_serial"), QStringLiteral("DISK-A-123"))
+    };
+    QVERIFY(!HardwareFingerprint::fromComponents(4, incomplete).isSufficient());
+
+    const QList<Component> malformed = {
+        platform(QStringLiteral("product_uuid"),
+                 QStringLiteral("00000000-0000-0000-0000-000000000000")),
+        secondary(QStringLiteral("derived_machine_id"), derivedIdA()),
+        secondary(QStringLiteral("disk_serial"), QStringLiteral("DISK-A-123"))
+    };
+    License license;
+    license.version = 1;
+    license.licenseId = QStringLiteral("malformed-policy-4");
+    license.product = QStringLiteral("MyApp");
+    license.issueDate = QDateTime::currentDateTimeUtc().addSecs(-30);
+    license.fingerprintPolicyVersion = 4;
+    license.fingerprintHash = QString(64, QLatin1Char('a'));
+    license.fingerprintComponents = componentsJson(malformed, 4);
+    license.nonce = QStringLiteral("nonce");
+
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    QCOMPARE(validate(license, current), ValidationError::MalformedPayload);
+}
+
+void HardwareFingerprintTests::editedPolicyFourLicenseHasInvalidSignature() {
+    const HardwareFingerprint current = HardwareFingerprint::fromComponents(
+        4, platformComponents());
+    const QByteArray original = signedKey(licenseFor(current));
+    QJsonObject envelope = QJsonDocument::fromJson(
+        QByteArray::fromBase64(original)).object();
+    QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
+    QJsonObject fingerprint = payload.value(
+        QStringLiteral("fingerprint")).toObject();
+    fingerprint.insert(QStringLiteral("hash"), QString(64, QLatin1Char('a')));
+    payload.insert(QStringLiteral("fingerprint"), fingerprint);
+    envelope.insert(QStringLiteral("payload"), payload);
+    const QByteArray tampered = QJsonDocument(envelope)
+                                    .toJson(QJsonDocument::Compact)
+                                    .toBase64();
+
+    LicenseValidator validator(
+        m_publicKeyPem, QStringLiteral("MyApp"),
+        [current](int policyVersion) {
+            return policyVersion == current.policyVersion()
+                       ? current
+                       : HardwareFingerprint::fromComponents(policyVersion, {});
+        });
+    License output;
+    QCOMPARE(validator.validateData(tampered, output),
+             ValidationError::SignatureInvalid);
+    QVERIFY(!output.entitlementsAvailable());
 }
 
 QTEST_APPLESS_MAIN(HardwareFingerprintTests)

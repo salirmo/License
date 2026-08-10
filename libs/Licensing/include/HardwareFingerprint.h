@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 namespace licensing {
 
@@ -14,7 +15,14 @@ public:
         Unknown,
         Strong,
         Secondary,
-        Informational
+        Informational,
+        Platform
+    };
+
+    enum class EvidenceState {
+        Match,
+        Mismatch,
+        Unavailable
     };
 
     struct Component {
@@ -28,6 +36,12 @@ public:
         int strongMatches = 0;
         int bindingMatches = 0;
         int mismatches = 0;
+        bool referenceHasPlatform = false;
+        EvidenceState platformState = EvidenceState::Unavailable;
+        EvidenceState secondaryState = EvidenceState::Unavailable;
+        int secondaryMatches = 0;
+        int secondaryMismatches = 0;
+        int secondaryUnavailable = 0;
     };
 
     static constexpr int LegacyPolicyVersion = 1;
@@ -35,7 +49,8 @@ public:
     // Policy 3 keeps weak diagnostic values out of machine matching but can
     // create a device-specific fingerprint without privileged DMI access.
     static constexpr int UnprivilegedPolicyVersion = 3;
-    static constexpr int CurrentPolicyVersion = UnprivilegedPolicyVersion;
+    static constexpr int PlatformPolicyVersion = 4;
+    static constexpr int CurrentPolicyVersion = PlatformPolicyVersion;
     static constexpr int HardwareChangeTolerance = 1;
     static constexpr int MinimumBindingIdentifiers = 2;
 
@@ -51,6 +66,7 @@ public:
     void refresh();
     int policyVersion() const;
     bool isSufficient() const;
+    bool platformIdentitySetupRequired() const;
     QString errorString() const;
     QString fingerprintHash() const;
     QList<Component> components() const;
@@ -61,6 +77,7 @@ public:
 
     static bool isSupportedPolicy(int policyVersion);
     static bool isBindingRole(ComponentRole role);
+    static bool isPlatformRole(ComponentRole role);
     static QString roleName(ComponentRole role);
     static ComponentRole componentRole(const QString& name, int policyVersion);
     static QString normalizeValue(const QString& name,
@@ -71,6 +88,7 @@ public:
                               int policyVersion);
     static bool hasSufficientIdentifiers(const QList<Component>& components,
                                          int policyVersion);
+    static bool hasPlatformIdentity(const QList<Component>& components);
     static QString calculateHash(const QList<Component>& components,
                                  int policyVersion);
     static MatchResult evaluateMatch(const QList<Component>& current,
@@ -88,6 +106,8 @@ public:
     static QString rootDiskSerialFromLsblkJson(
         const QByteArray& json,
         const QString& rootSource = {});
+    static QString deriveApplicationMachineId(const QString& machineId);
+    static QString normalizePermanentMacAddresses(const QStringList& addresses);
 
 private:
     struct SkipRefreshTag {};
@@ -106,12 +126,15 @@ private:
     QString readLegacyPrimaryDiskSerial();
     QString readMacAddresses();
     QString readMachineId();
+    QString readPermanentMacAddresses();
+    QString readDerivedMachineId();
     QString readOsInfo();
 
     int m_policyVersion = CurrentPolicyVersion;
     QList<Component> m_components;
     QString m_fingerprintHash;
     QString m_error;
+    bool m_platformCollectionBlocked = false;
 };
 
 } // namespace licensing

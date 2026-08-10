@@ -1,8 +1,10 @@
 #include "HardwareFingerprint.h"
 
 #include "CryptoManager.h"
+#include "PlatformIdentity.h"
 
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -17,11 +19,54 @@
 
 #include <algorithm>
 
+#include <openssl/hmac.h>
+
+#ifdef Q_OS_LINUX
+#include <linux/if_arp.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
 namespace licensing {
 namespace {
 
 using Component = HardwareFingerprint::Component;
 using ComponentRole = HardwareFingerprint::ComponentRole;
+
+bool isPolicy4PlatformName(const QString& name) {
+    return name == QStringLiteral("product_uuid")
+           || name == QStringLiteral("product_serial")
+           || name == QStringLiteral("board_serial");
+}
+
+bool isPolicy4SecondaryName(const QString& name) {
+    return name == QStringLiteral("permanent_mac")
+           || name == QStringLiteral("derived_machine_id")
+           || name == QStringLiteral("disk_serial");
+}
+
+QString componentValue(const QList<Component>& components,
+                       const QString& name,
+                       ComponentRole role) {
+    const auto component = std::find_if(
+        components.cbegin(), components.cend(),
+        [&name, role](const Component& candidate) {
+            return candidate.name == name && candidate.role == role;
+        });
+    return component == components.cend() ? QString() : component->value;
+}
+
+bool hasAnyPlatformComponent(const QList<Component>& components) {
+    return std::any_of(
+        components.cbegin(), components.cend(),
+        [](const Component& component) {
+            return component.role == ComponentRole::Platform;
+        });
+}
 
 const QSet<QString>& invalidIdentifierValues() {
     static const QSet<QString> values = {
@@ -129,11 +174,17 @@ HardwareFingerprint HardwareFingerprint::fromComponents(
 bool HardwareFingerprint::isSupportedPolicy(int policyVersion) {
     return policyVersion == LegacyPolicyVersion
            || policyVersion == HardenedPolicyVersion
-           || policyVersion == UnprivilegedPolicyVersion;
+           || policyVersion == UnprivilegedPolicyVersion
+           || policyVersion == PlatformPolicyVersion;
 }
 
 bool HardwareFingerprint::isBindingRole(ComponentRole role) {
-    return role == ComponentRole::Strong || role == ComponentRole::Secondary;
+    return role == ComponentRole::Strong || role == ComponentRole::Secondary
+           || role == ComponentRole::Platform;
+}
+
+bool HardwareFingerprint::isPlatformRole(ComponentRole role) {
+    return role == ComponentRole::Platform;
 }
 
 QString HardwareFingerprint::roleName(ComponentRole role) {
@@ -144,6 +195,8 @@ QString HardwareFingerprint::roleName(ComponentRole role) {
         return QStringLiteral("secondary");
     case ComponentRole::Informational:
         return QStringLiteral("informational");
+    case ComponentRole::Platform:
+        return QStringLiteral("platform");
     case ComponentRole::Unknown:
         break;
     }
@@ -163,6 +216,21 @@ HardwareFingerprint::ComponentRole HardwareFingerprint::componentRole(
             return ComponentRole::Secondary;
         }
         if (name == QStringLiteral("mac") || name == QStringLiteral("os")) {
+            return ComponentRole::Informational;
+        }
+        return ComponentRole::Unknown;
+    }
+
+    if (policyVersion == PlatformPolicyVersion) {
+        if (isPolicy4PlatformName(name)) {
+            return ComponentRole::Platform;
+        }
+        if (isPolicy4SecondaryName(name)) {
+            return ComponentRole::Secondary;
+        }
+        if (name == QStringLiteral("cpu_model")
+            || name == QStringLiteral("bios_version")
+            || name == QStringLiteral("os")) {
             return ComponentRole::Informational;
         }
         return ComponentRole::Unknown;
@@ -195,6 +263,31 @@ QString HardwareFingerprint::normalizeValue(const QString& name,
     if (policyVersion == LegacyPolicyVersion) {
         return value.trimmed();
     }
+    if (policyVersion == PlatformPolicyVersion) {
+        if (name == QStringLiteral("product_uuid")) {
+            return PlatformIdentity::normalizeProductUuid(value);
+        }
+        if (name == QStringLiteral("product_serial")
+            || name == QStringLiteral("board_serial")
+            || name == QStringLiteral("disk_serial")) {
+            return PlatformIdentity::normalizeSerial(value);
+        }
+        if (name == QStringLiteral("derived_machine_id")) {
+            const QString normalized = value.trimmed().toLower();
+            static const QRegularExpression derivedId(
+                QStringLiteral("^[0-9a-f]{64}$"));
+            return derivedId.match(normalized).hasMatch()
+                           && !isRepeatedPlaceholder(normalized)
+                       ? normalized
+                       : QString();
+        }
+        if (name == QStringLiteral("permanent_mac")) {
+            return normalizePermanentMacAddresses(
+                value.split(QLatin1Char(','), Qt::SkipEmptyParts));
+        }
+        return value.simplified().toLower();
+    }
+
     if (policyVersion != HardenedPolicyVersion
         && policyVersion != UnprivilegedPolicyVersion) {
         return {};
@@ -242,6 +335,36 @@ bool HardwareFingerprint::isUsableValue(const QString& name,
     if (policyVersion == LegacyPolicyVersion) {
         return true;
     }
+    if (policyVersion == PlatformPolicyVersion) {
+        const ComponentRole role = componentRole(name, policyVersion);
+        if (role == ComponentRole::Unknown) {
+            return false;
+        }
+        if (role == ComponentRole::Informational) {
+            return true;
+        }
+        if (name == QStringLiteral("product_uuid")) {
+            return PlatformIdentity::isUsableProductUuid(normalizedValue);
+        }
+        if (name == QStringLiteral("product_serial")
+            || name == QStringLiteral("board_serial")
+            || name == QStringLiteral("disk_serial")) {
+            return PlatformIdentity::isUsableSerial(normalizedValue);
+        }
+        if (name == QStringLiteral("derived_machine_id")) {
+            static const QRegularExpression derivedId(
+                QStringLiteral("^[0-9a-f]{64}$"));
+            return derivedId.match(normalizedValue).hasMatch()
+                   && !isRepeatedPlaceholder(normalizedValue);
+        }
+        if (name == QStringLiteral("permanent_mac")) {
+            return !normalizePermanentMacAddresses(
+                        normalizedValue.split(QLatin1Char(','), Qt::SkipEmptyParts))
+                        .isEmpty();
+        }
+        return false;
+    }
+
     if ((policyVersion != HardenedPolicyVersion
          && policyVersion != UnprivilegedPolicyVersion)
         || componentRole(name, policyVersion) == ComponentRole::Unknown) {
@@ -301,6 +424,7 @@ void HardwareFingerprint::refresh() {
     m_components.clear();
     m_fingerprintHash.clear();
     m_error.clear();
+    m_platformCollectionBlocked = false;
 
     if (m_policyVersion == LegacyPolicyVersion) {
         addComponent(QStringLiteral("mb_uuid"), readBoardSerial(),
@@ -337,6 +461,62 @@ void HardwareFingerprint::refresh() {
                      ComponentRole::Informational);
         addComponent(QStringLiteral("os"), readOsInfo(),
                      ComponentRole::Informational);
+    } else if (m_policyVersion == PlatformPolicyVersion) {
+        PlatformIdentityValues snapshotValues;
+        QString snapshotError;
+        const SnapshotStatus snapshotStatus =
+            PlatformIdentity::readTrustedSnapshot(
+                PlatformIdentity::defaultSnapshotPath(),
+                PlatformIdentity::currentBootId(), snapshotValues,
+                &snapshotError);
+
+        PlatformIdentityValues platformValues;
+        if (snapshotStatus == SnapshotStatus::Valid
+            && snapshotValues.hasTrustworthyIdentity()) {
+            platformValues = snapshotValues;
+        } else {
+            const DirectPlatformIdentity direct = PlatformIdentity::readDirect();
+            if (direct.values.hasTrustworthyIdentity()) {
+                platformValues = direct.values;
+            } else if (snapshotStatus == SnapshotStatus::Valid) {
+                platformValues = snapshotValues;
+            }
+            if (snapshotStatus != SnapshotStatus::Valid
+                && !platformValues.hasTrustworthyIdentity()
+                && (direct.inaccessibleDmi
+                    || snapshotStatus == SnapshotStatus::Stale
+                    || snapshotStatus == SnapshotStatus::Invalid
+                    || snapshotStatus == SnapshotStatus::Untrusted)) {
+                m_platformCollectionBlocked = true;
+            }
+        }
+
+        if (platformValues.hasProductUuid()) {
+            addComponent(QStringLiteral("product_uuid"),
+                         platformValues.productUuid, ComponentRole::Platform);
+            addComponent(QStringLiteral("product_serial"),
+                         platformValues.productSerial, ComponentRole::Platform);
+            addComponent(QStringLiteral("board_serial"),
+                         platformValues.boardSerial, ComponentRole::Platform);
+        } else if (platformValues.hasSerialPair()) {
+            addComponent(QStringLiteral("product_serial"),
+                         platformValues.productSerial, ComponentRole::Platform);
+            addComponent(QStringLiteral("board_serial"),
+                         platformValues.boardSerial, ComponentRole::Platform);
+        }
+
+        addComponent(QStringLiteral("permanent_mac"),
+                     readPermanentMacAddresses(), ComponentRole::Secondary);
+        addComponent(QStringLiteral("derived_machine_id"),
+                     readDerivedMachineId(), ComponentRole::Secondary);
+        addComponent(QStringLiteral("disk_serial"), readRootDiskSerial(),
+                     ComponentRole::Secondary);
+        addComponent(QStringLiteral("cpu_model"), readCpuModel(),
+                     ComponentRole::Informational);
+        addComponent(QStringLiteral("bios_version"), readBiosVersion(),
+                     ComponentRole::Informational);
+        addComponent(QStringLiteral("os"), readOsInfo(),
+                     ComponentRole::Informational);
     }
 
     finalize();
@@ -350,8 +530,17 @@ void HardwareFingerprint::finalize() {
         m_error = QStringLiteral("Unsupported hardware fingerprint policy.");
         return;
     }
+    if (m_policyVersion == PlatformPolicyVersion
+        && m_platformCollectionBlocked
+        && !hasPlatformIdentity(m_components)) {
+        m_error = QStringLiteral(
+            "Trusted platform identity is unavailable. Install or refresh the "
+            "systemd hardware-identity snapshot before activation.");
+        return;
+    }
     if ((m_policyVersion == HardenedPolicyVersion
-         || m_policyVersion == UnprivilegedPolicyVersion)
+         || m_policyVersion == UnprivilegedPolicyVersion
+         || m_policyVersion == PlatformPolicyVersion)
         && !hasSufficientIdentifiers(m_components, m_policyVersion)) {
         int strongCount = 0;
         int bindingCount = 0;
@@ -372,7 +561,7 @@ void HardwareFingerprint::finalize() {
                 "and %2 total binding identifiers.")
                           .arg(strongCount)
                           .arg(bindingCount);
-        } else {
+        } else if (m_policyVersion == UnprivilegedPolicyVersion) {
             const int requiredCount =
                 (bindingNames.contains(QStringLiteral("disk_serial")) ? 1 : 0)
                 + (bindingNames.contains(QStringLiteral("machine_id")) ? 1 : 0);
@@ -381,6 +570,11 @@ void HardwareFingerprint::finalize() {
                 "serial and Linux machine-id. Found %1 of 2 required "
                 "identifiers.")
                           .arg(requiredCount);
+        } else {
+            m_error = QStringLiteral(
+                "Fingerprint policy 4 requires a valid product UUID, a valid "
+                "product-serial/board-serial pair, or at least two independent "
+                "secondary identifiers.");
         }
         return;
     }
@@ -397,6 +591,12 @@ int HardwareFingerprint::policyVersion() const {
 
 bool HardwareFingerprint::isSufficient() const {
     return m_error.isEmpty() && !m_fingerprintHash.isEmpty();
+}
+
+bool HardwareFingerprint::platformIdentitySetupRequired() const {
+    return m_policyVersion == PlatformPolicyVersion
+           && m_platformCollectionBlocked
+           && !hasPlatformIdentity(m_components);
 }
 
 QString HardwareFingerprint::errorString() const {
@@ -444,8 +644,25 @@ bool HardwareFingerprint::hasSufficientIdentifiers(
         return true;
     }
     if (policyVersion != HardenedPolicyVersion
-        && policyVersion != UnprivilegedPolicyVersion) {
+        && policyVersion != UnprivilegedPolicyVersion
+        && policyVersion != PlatformPolicyVersion) {
         return false;
+    }
+
+    if (policyVersion == PlatformPolicyVersion) {
+        if (hasAnyPlatformComponent(components)) {
+            return hasPlatformIdentity(components);
+        }
+
+        QSet<QString> secondaryNames;
+        for (const Component& component : components) {
+            if (component.role == ComponentRole::Secondary
+                && isUsableValue(component.name, component.value,
+                                 policyVersion)) {
+                secondaryNames.insert(component.name);
+            }
+        }
+        return secondaryNames.size() >= MinimumBindingIdentifiers;
     }
 
     QSet<QString> bindingNames;
@@ -473,11 +690,27 @@ bool HardwareFingerprint::hasSufficientIdentifiers(
            && bindingNames.contains(QStringLiteral("machine_id"));
 }
 
+bool HardwareFingerprint::hasPlatformIdentity(
+    const QList<Component>& components) {
+    const QString productUuid = componentValue(
+        components, QStringLiteral("product_uuid"), ComponentRole::Platform);
+    if (!productUuid.isEmpty()) {
+        return true;
+    }
+    return !componentValue(components, QStringLiteral("product_serial"),
+                           ComponentRole::Platform)
+                .isEmpty()
+           && !componentValue(components, QStringLiteral("board_serial"),
+                              ComponentRole::Platform)
+                   .isEmpty();
+}
+
 QString HardwareFingerprint::calculateHash(const QList<Component>& components,
                                            int policyVersion) {
     if (!isSupportedPolicy(policyVersion)
         || ((policyVersion == HardenedPolicyVersion
-             || policyVersion == UnprivilegedPolicyVersion)
+             || policyVersion == UnprivilegedPolicyVersion
+             || policyVersion == PlatformPolicyVersion)
             && !hasSufficientIdentifiers(components, policyVersion))) {
         return {};
     }
@@ -507,6 +740,102 @@ HardwareFingerprint::MatchResult HardwareFingerprint::evaluateMatch(
     if (!isSupportedPolicy(policyVersion) || tolerance < 0) {
         return result;
     }
+
+    if (policyVersion == PlatformPolicyVersion) {
+        result.referenceHasPlatform = hasPlatformIdentity(reference);
+        if (hasAnyPlatformComponent(reference)
+            && !result.referenceHasPlatform) {
+            result.platformState = EvidenceState::Unavailable;
+            return result;
+        }
+
+        if (result.referenceHasPlatform) {
+            if (!hasPlatformIdentity(current)) {
+                result.platformState = EvidenceState::Unavailable;
+                return result;
+            }
+
+            const QString referenceUuid = componentValue(
+                reference, QStringLiteral("product_uuid"),
+                ComponentRole::Platform);
+            const QString currentUuid = componentValue(
+                current, QStringLiteral("product_uuid"),
+                ComponentRole::Platform);
+            if (!referenceUuid.isEmpty() && !currentUuid.isEmpty()) {
+                result.platformState = referenceUuid == currentUuid
+                                           ? EvidenceState::Match
+                                           : EvidenceState::Mismatch;
+                result.valid = result.platformState == EvidenceState::Match;
+                return result;
+            }
+
+            const QString referenceProductSerial = componentValue(
+                reference, QStringLiteral("product_serial"),
+                ComponentRole::Platform);
+            const QString referenceBoardSerial = componentValue(
+                reference, QStringLiteral("board_serial"),
+                ComponentRole::Platform);
+            const QString currentProductSerial = componentValue(
+                current, QStringLiteral("product_serial"),
+                ComponentRole::Platform);
+            const QString currentBoardSerial = componentValue(
+                current, QStringLiteral("board_serial"),
+                ComponentRole::Platform);
+
+            if (referenceProductSerial.isEmpty()
+                || referenceBoardSerial.isEmpty()
+                || currentProductSerial.isEmpty()
+                || currentBoardSerial.isEmpty()) {
+                result.platformState = EvidenceState::Unavailable;
+                return result;
+            }
+
+            result.platformState =
+                referenceProductSerial == currentProductSerial
+                        && referenceBoardSerial == currentBoardSerial
+                    ? EvidenceState::Match
+                    : EvidenceState::Mismatch;
+            result.valid = result.platformState == EvidenceState::Match;
+            return result;
+        }
+
+        QHash<QString, Component> currentSecondary;
+        for (const Component& component : current) {
+            if (component.role == ComponentRole::Secondary) {
+                currentSecondary.insert(component.name, component);
+            }
+        }
+
+        for (const Component& component : reference) {
+            if (component.role != ComponentRole::Secondary) {
+                continue;
+            }
+            const auto candidate = currentSecondary.constFind(component.name);
+            if (candidate == currentSecondary.cend()) {
+                ++result.secondaryUnavailable;
+            } else if (candidate->value == component.value) {
+                ++result.secondaryMatches;
+            } else {
+                ++result.secondaryMismatches;
+            }
+        }
+
+        result.bindingMatches = result.secondaryMatches;
+        result.mismatches = result.secondaryMismatches;
+        if (result.secondaryMatches >= MinimumBindingIdentifiers
+            && result.secondaryMismatches <= 1) {
+            result.secondaryState = EvidenceState::Match;
+            result.valid = true;
+        } else if (result.secondaryMismatches > 1
+                   || result.secondaryMatches + result.secondaryMismatches
+                          >= MinimumBindingIdentifiers) {
+            result.secondaryState = EvidenceState::Mismatch;
+        } else {
+            result.secondaryState = EvidenceState::Unavailable;
+        }
+        return result;
+    }
+
     if ((policyVersion == HardenedPolicyVersion
          || policyVersion == UnprivilegedPolicyVersion)
         && (!hasSufficientIdentifiers(current, policyVersion)
@@ -793,11 +1122,205 @@ QString HardwareFingerprint::readMacAddresses() {
     return macAddresses.join(QLatin1Char(','));
 }
 
+QString HardwareFingerprint::normalizePermanentMacAddresses(
+    const QStringList& addresses) {
+    QStringList normalizedAddresses;
+    static const QRegularExpression macHex(QStringLiteral("^[0-9a-f]{12}$"));
+
+    for (QString address : addresses) {
+        address = address.trimmed().toLower();
+        address.remove(QLatin1Char(':'));
+        address.remove(QLatin1Char('-'));
+        address.remove(QLatin1Char('.'));
+        if (!macHex.match(address).hasMatch()) {
+            continue;
+        }
+
+        const QByteArray bytes = QByteArray::fromHex(address.toLatin1());
+        if (bytes.size() != 6
+            || (static_cast<unsigned char>(bytes.at(0)) & 0x01U) != 0U
+            || bytes == QByteArray(6, '\0')
+            || bytes == QByteArray(6, static_cast<char>(0xff))) {
+            continue;
+        }
+
+        QStringList octets;
+        for (unsigned char byte : bytes) {
+            octets.append(QStringLiteral("%1").arg(byte, 2, 16, QLatin1Char('0')));
+        }
+        const QString normalized = octets.join(QLatin1Char(':'));
+        if (!normalizedAddresses.contains(normalized)) {
+            normalizedAddresses.append(normalized);
+        }
+    }
+
+    normalizedAddresses.sort();
+    return normalizedAddresses.join(QLatin1Char(','));
+}
+
+QString HardwareFingerprint::readPermanentMacAddresses() {
+#ifdef Q_OS_LINUX
+    // IFLA_PERM_ADDRESS is Linux UAPI attribute 54. Defining the numeric UAPI
+    // value keeps builds working with older distribution headers while a newer
+    // runtime kernel can still return the attribute.
+    constexpr unsigned short PermanentAddressAttribute = 54;
+
+    const int socketFd = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
+                                  NETLINK_ROUTE);
+    if (socketFd < 0) {
+        return {};
+    }
+
+    sockaddr_nl localAddress{};
+    localAddress.nl_family = AF_NETLINK;
+    if (::bind(socketFd, reinterpret_cast<sockaddr*>(&localAddress),
+               sizeof(localAddress)) != 0) {
+        ::close(socketFd);
+        return {};
+    }
+
+    timeval timeout{};
+    timeout.tv_sec = 2;
+    ::setsockopt(socketFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct Request {
+        nlmsghdr header;
+        ifinfomsg interface;
+    } request{};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = 1;
+    request.interface.ifi_family = AF_UNSPEC;
+
+    sockaddr_nl kernelAddress{};
+    kernelAddress.nl_family = AF_NETLINK;
+    if (::sendto(socketFd, &request, request.header.nlmsg_len, 0,
+                 reinterpret_cast<sockaddr*>(&kernelAddress),
+                 sizeof(kernelAddress)) < 0) {
+        ::close(socketFd);
+        return {};
+    }
+
+    QStringList addresses;
+    bool finished = false;
+    while (!finished) {
+        char buffer[32768];
+        const ssize_t received = ::recv(socketFd, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+
+        int remaining = static_cast<int>(received);
+        for (nlmsghdr* message = reinterpret_cast<nlmsghdr*>(buffer);
+             NLMSG_OK(message, remaining);
+             message = NLMSG_NEXT(message, remaining)) {
+            if (message->nlmsg_seq != request.header.nlmsg_seq) {
+                continue;
+            }
+            if (message->nlmsg_type == NLMSG_DONE) {
+                finished = true;
+                break;
+            }
+            if (message->nlmsg_type == NLMSG_ERROR) {
+                finished = true;
+                break;
+            }
+            if (message->nlmsg_type != RTM_NEWLINK) {
+                continue;
+            }
+
+            const auto* interface = reinterpret_cast<const ifinfomsg*>(
+                NLMSG_DATA(message));
+            if ((interface->ifi_flags & IFF_LOOPBACK) != 0
+                || interface->ifi_type != ARPHRD_ETHER) {
+                continue;
+            }
+
+            QString interfaceName;
+            QByteArray permanentAddress;
+            int attributeBytes = IFLA_PAYLOAD(message);
+            for (rtattr* attribute = IFLA_RTA(interface);
+                 RTA_OK(attribute, attributeBytes);
+                 attribute = RTA_NEXT(attribute, attributeBytes)) {
+                if (attribute->rta_type == IFLA_IFNAME) {
+                    const int length = RTA_PAYLOAD(attribute);
+                    interfaceName = QString::fromUtf8(
+                        static_cast<const char*>(RTA_DATA(attribute)),
+                        std::max(0, length - 1));
+                } else if (attribute->rta_type == PermanentAddressAttribute) {
+                    permanentAddress = QByteArray(
+                        static_cast<const char*>(RTA_DATA(attribute)),
+                        RTA_PAYLOAD(attribute));
+                }
+            }
+
+            // Physical devices have a sysfs device link. VLANs, bridges, veth,
+            // tunnels, and most other software-created interfaces do not.
+            if (interfaceName.isEmpty()
+                || !QFileInfo::exists(QStringLiteral("/sys/class/net/")
+                                      + interfaceName
+                                      + QStringLiteral("/device"))
+                || permanentAddress.size() != 6) {
+                continue;
+            }
+
+            QStringList octets;
+            for (unsigned char byte : permanentAddress) {
+                octets.append(
+                    QStringLiteral("%1").arg(byte, 2, 16, QLatin1Char('0')));
+            }
+            addresses.append(octets.join(QLatin1Char(':')));
+        }
+    }
+    ::close(socketFd);
+    return normalizePermanentMacAddresses(addresses);
+#else
+    return {};
+#endif
+}
+
 QString HardwareFingerprint::readMachineId() {
     QFile file(QStringLiteral("/etc/machine-id"));
     return file.open(QIODevice::ReadOnly)
                ? QString::fromUtf8(file.readAll()).trimmed()
                : QString();
+}
+
+QString HardwareFingerprint::deriveApplicationMachineId(
+    const QString& machineId) {
+    QString compact = machineId.simplified().toLower();
+    compact.remove(QLatin1Char('-'));
+    compact.remove(QLatin1Char('{'));
+    compact.remove(QLatin1Char('}'));
+    compact.remove(QLatin1Char(' '));
+    static const QRegularExpression machineIdHex(
+        QStringLiteral("^[0-9a-f]{32}$"));
+    if (!machineIdHex.match(compact).hasMatch()
+        || isRepeatedPlaceholder(compact)) {
+        return {};
+    }
+
+    const QByteArray key = QByteArray::fromHex(compact.toLatin1());
+    const QByteArray applicationContext = QByteArrayLiteral(
+        "sgi.face-detection-viewer.licensing.machine-id.v1");
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digestLength = 0;
+    if (!HMAC(EVP_sha256(), key.constData(), key.size(),
+              reinterpret_cast<const unsigned char*>(
+                  applicationContext.constData()),
+              applicationContext.size(), digest, &digestLength)
+        || digestLength != 32) {
+        return {};
+    }
+    return QString::fromLatin1(
+        QByteArray(reinterpret_cast<const char*>(digest),
+                   static_cast<int>(digestLength))
+            .toHex());
+}
+
+QString HardwareFingerprint::readDerivedMachineId() {
+    return deriveApplicationMachineId(readMachineId());
 }
 
 QString HardwareFingerprint::readOsInfo() {

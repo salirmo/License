@@ -24,7 +24,9 @@ enum class ValidationError {
     Expired,
     NotYetValid,
     EntitlementsInvalid,
-    MalformedPayload
+    MalformedPayload,
+    // Appended to preserve the numeric values of every pre-policy-4 error.
+    PlatformIdentityUnavailable
 };
 
 class LicenseValidator {

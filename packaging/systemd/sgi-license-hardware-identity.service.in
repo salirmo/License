@@ -1,0 +1,33 @@
+[Unit]
+Description=SGI licensing hardware identity snapshot
+Documentation=file://@CMAKE_INSTALL_FULL_DOCDIR@/HARDWARE_IDENTITY_HELPER.md
+After=local-fs.target
+Before=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=@CMAKE_INSTALL_FULL_LIBEXECDIR@/sgi-license-hardware-identity
+StateDirectory=sgi-license
+StateDirectoryMode=0755
+UMask=0022
+User=root
+Group=root
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Some virtualized/sysfs setups expose root-only DMI files with an owner that
+# is mapped to nobody. Keep only the read/search DAC bypass needed to collect
+# those files; the helper receives no write-bypass or hardware-management caps.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ReadWritePaths=/var/lib/sgi-license
+
+[Install]
+WantedBy=multi-user.target
